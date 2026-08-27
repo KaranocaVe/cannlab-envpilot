@@ -1,0 +1,31 @@
+{
+  "name": "cannlab-envpilot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A safe command-line control plane for CANNLab environments.",
+  "type": "module",
+  "bin": {
+    "cannlabctl": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test \"test/**/*.test.ts\"",
+    "test:live": "tsx --test test/live.test.ts",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "commander": "^14.0.0",
+    "dotenv": "^17.2.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}
