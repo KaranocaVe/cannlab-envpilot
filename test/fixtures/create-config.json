@@ -1,0 +1,29 @@
+{
+  "code": 0,
+  "data": {
+    "goods_code": "goods-cpu",
+    "goods_name": "CPU",
+    "env_types": [
+      {
+        "goods_code": "goods-cpu",
+        "resource_type": "cpu",
+        "templates": [
+          {
+            "template_code": "template-cpu",
+            "template_name": "CANN base",
+            "image_code": "image-cpu-1",
+            "image_name": "CANN image",
+            "cann_version": "8.2.RC1",
+            "specs": [
+              {
+                "template_spec_code": "template-spec-cpu",
+                "template_spec_name": "Ubuntu",
+                "default_selected": true
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

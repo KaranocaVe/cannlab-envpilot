@@ -1,0 +1,23 @@
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {
+        "instance_key": "npu-instance-1",
+        "pair_id": "pair-1",
+        "instance_name": "demo-a2",
+        "type": "A2",
+        "status": "running"
+      },
+      {
+        "instance_key": "cpu-instance-1",
+        "instance_name": "demo-cpu",
+        "type": "cpu",
+        "status": "stopped"
+      }
+    ],
+    "page": 1,
+    "per_page": 100,
+    "total": 2
+  }
+}

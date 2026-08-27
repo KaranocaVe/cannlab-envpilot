@@ -1,0 +1,22 @@
+{
+  "code": 0,
+  "data": [
+    {
+      "goods_code": "goods-cpu",
+      "goods_name": "CPU",
+      "goods_type": "RESOURCE",
+      "spec_code": "spec-cpu-small",
+      "spec_name": "2 vCPU / 8 GiB",
+      "attributes": { "resourceType": "cpu" },
+      "default": true
+    },
+    {
+      "goods_code": "goods-a2",
+      "goods_name": "Ascend A2",
+      "goods_type": "RESOURCE",
+      "spec_code": "spec-a2-small",
+      "spec_name": "1 NPU",
+      "attributes": { "resourceType": "a2" }
+    }
+  ]
+}
