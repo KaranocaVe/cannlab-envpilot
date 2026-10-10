@@ -60,6 +60,28 @@ https://web-api.gitcode.com/score-proxy/api/v1/shop/third-party
 
 Use `CANNLAB_API_BASE` for a compatible test endpoint. GET requests have bounded retries; create, delete, and lifecycle POST requests are never automatically replayed because a network failure can leave the remote operation ambiguous.
 
-This repository is local-only for now. It does not configure a Git remote or push credentials.
+This public repository contains no runtime tokens or local `.env` files. Local authentication caches stay outside version control.
 
 The separate live test is opt-in: set `CANNLAB_RUN_LIVE=1` for read-only checks, and additionally set `CANNLAB_ALLOW_LIVE_MUTATIONS=1` only when the temporary CPU lifecycle test is explicitly authorized.
+
+## Userscript: retry an NPU start
+
+`userscripts/cannlab-card-grabber.user.js` is a Tampermonkey userscript for the
+GitCode CANNLab environment page. It discovers the visible environment rows and
+retries the `Start` flow for the environments you select when the platform
+reports insufficient resources.
+
+1. Install the script from [GitHub Raw](https://raw.githubusercontent.com/KaranocaVe/cannlab-envpilot/main/userscripts/cannlab-card-grabber.user.js) in Tampermonkey.
+2. Open <https://gitcode.com/org/cann/cannlab/environment>.
+3. Select the target environment. The observed environment `DevEnvC_zkLx2` is selected by default.
+4. Click `开始抢卡` and leave the page open.
+
+The script uses visible DOM buttons only; it does not call CANNLab APIs, replay
+network requests, or create environments. It checks the page every 2.5 seconds
+and waits 30 seconds after an explicit insufficient-resource response before
+retrying. While the selected environment is in a transition state such as
+`Configuring network...`, it waits without clicking Start again. It stops when
+the environment is `Running`, enters `Error`, disappears, or its startup state
+remains ambiguous for too long. The panel includes an attempt counter, a
+collapsible log, auto-confirm and stop-on-success settings, and an optional
+Screen Wake Lock while the retry loop is active.
