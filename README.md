@@ -89,4 +89,8 @@ stops without submitting a request. It also stops when the environment is
 `Running`, enters `Error`, disappears, or its startup state remains ambiguous
 for too long. The panel includes an attempt counter, a collapsible log,
 auto-confirm and stop-on-success settings, and an optional Screen Wake Lock
-while the retry loop is active.
+while the page is in the foreground. A dedicated Worker schedules background
+checks where the browser allows it, and returning to the tab triggers an
+immediate check. Browsers may still freeze or discard a hidden page; no
+userscript can keep running after that happens, so foreground operation is the
+reliable mode.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CANNLab 自动开机/抢卡助手
 // @namespace    https://github.com/KaranocaVe/cannlab-envpilot
-// @version      1.2.0
+// @version      1.3.0
 // @description  自动识别 CANNLab 环境，通过可见按钮循环重试 NPU 开机并在成功或异常状态时停止。
 // @author       KaranocaVe
 // @match        https://gitcode.com/org/cann/cannlab/environment*
@@ -44,6 +44,11 @@
     running: false,
     ticking: false,
     timer: null,
+    timerWorker: null,
+    timerWorkerUrl: null,
+    nextTickAt: 0,
+    retryNotBefore: 0,
+    tickPending: false,
     targetRefreshTimer: null,
     observer: null,
     pendingName: null,
@@ -316,8 +321,121 @@
   }
 
   function scheduleTick(delay = Math.max(1500, Number(settings.intervalMs) || DEFAULTS.intervalMs)) {
+    const requestedDelay = Math.max(50, delay);
+    const wait = Math.max(requestedDelay, state.retryNotBefore - Date.now());
+    state.nextTickAt = Date.now() + wait;
     clearTimeout(state.timer);
-    state.timer = setTimeout(() => tick(), Math.max(50, delay));
+    state.timer = null;
+    if (state.timerWorker) {
+      state.timerWorker.postMessage({ type: 'schedule', delay: wait });
+      return;
+    }
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      runScheduledTick();
+    }, wait);
+  }
+
+  function cancelScheduledTick() {
+    clearTimeout(state.timer);
+    state.timer = null;
+    if (state.timerWorker) state.timerWorker.postMessage({ type: 'cancel' });
+    state.nextTickAt = 0;
+  }
+
+  function runScheduledTick() {
+    if (!state.running) return;
+    if (state.ticking) {
+      state.tickPending = true;
+      return;
+    }
+    tick();
+  }
+
+  function stopTimerWorker() {
+    const worker = state.timerWorker;
+    state.timerWorker = null;
+    if (worker) {
+      worker.onmessage = null;
+      worker.onerror = null;
+      worker.terminate();
+    }
+    if (state.timerWorkerUrl) {
+      URL.revokeObjectURL(state.timerWorkerUrl);
+      state.timerWorkerUrl = null;
+    }
+  }
+
+  function startTimerWorker() {
+    if (state.timerWorker) return true;
+    if (typeof Worker !== 'function' || typeof Blob !== 'function' || !URL.createObjectURL) return false;
+    try {
+      const source = `
+        let timer = null;
+        self.onmessage = ({ data }) => {
+          if (data?.type === 'cancel') {
+            clearTimeout(timer);
+            timer = null;
+          } else if (data?.type === 'schedule') {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+              timer = null;
+              self.postMessage({ type: 'tick' });
+            }, Math.max(50, Number(data.delay) || 50));
+          }
+        };
+        self.postMessage({ type: 'ready' });
+      `;
+      const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      const worker = new Worker(url);
+      state.timerWorker = worker;
+      state.timerWorkerUrl = url;
+      worker.onmessage = ({ data }) => {
+        if (data?.type === 'ready') {
+          if (state.timerWorkerUrl) {
+            URL.revokeObjectURL(state.timerWorkerUrl);
+            state.timerWorkerUrl = null;
+          }
+          return;
+        }
+        if (data?.type === 'tick') {
+          state.nextTickAt = 0;
+          runScheduledTick();
+        }
+      };
+      worker.onerror = (event) => {
+        event.preventDefault();
+        console.warn('[CANNLab 抢卡助手] 后台 Worker 定时器不可用，改用页面定时器。');
+        const remaining = Math.max(50, state.nextTickAt - Date.now());
+        cancelScheduledTick();
+        stopTimerWorker();
+        if (state.running) {
+          log('浏览器拦截了后台 Worker，已回退到页面定时器；后台检查频率可能下降。', 'warn');
+          scheduleTick(remaining);
+        }
+      };
+      return true;
+    } catch (error) {
+      console.warn('[CANNLab 抢卡助手] 无法创建后台 Worker 定时器，改用页面定时器。', error);
+      stopTimerWorker();
+      return false;
+    }
+  }
+
+  function retryAfterResourceShortage() {
+    const delay = Math.max(5000, Number(settings.retryDelayMs) || DEFAULTS.retryDelayMs);
+    state.retryNotBefore = Date.now() + delay;
+    log(`第 ${state.attempts} 次资源不足，${Math.ceil(delay / 1000)} 秒后重试。`, 'wait');
+    scheduleTick(delay);
+  }
+
+  function resumeCheck() {
+    if (state.running) scheduleTick(50);
+  }
+
+  function onVisibilityChange() {
+    requestWakeLock();
+    if (!document.hidden) resumeCheck();
   }
 
   async function confirmPowerOn() {
@@ -351,8 +469,9 @@
     state.pendingSince = 0;
     state.confirmAwaiting = false;
     state.manualConfirmPending = false;
-    clearTimeout(state.timer);
-    state.timer = null;
+    state.tickPending = false;
+    cancelScheduledTick();
+    stopTimerWorker();
     stopKeepAwake();
     setControls();
     log(reason, 'info');
@@ -382,12 +501,16 @@
     }
     log(`第 ${state.attempts} 次：已点击 ${candidate.name} 的启动按钮。`, 'action');
     await confirmPowerOn();
-    scheduleTick(Math.max(250, Number(settings.retryDelayMs) || DEFAULTS.retryDelayMs));
+    if (state.running) scheduleTick(Math.max(250, Number(settings.retryDelayMs) || DEFAULTS.retryDelayMs));
     return true;
   }
 
   async function tick() {
     if (!state.running || state.ticking) return;
+    if (Date.now() < state.retryNotBefore) {
+      scheduleTick(state.retryNotBefore - Date.now());
+      return;
+    }
     state.ticking = true;
     try {
       const rows = targetRows();
@@ -396,8 +519,7 @@
           closeStartDialog();
           state.pendingName = null;
           state.pendingSince = 0;
-          log(`第 ${state.attempts} 次资源不足，${Math.ceil(settings.retryDelayMs / 1000)} 秒后重试。`, 'wait');
-          scheduleTick(settings.retryDelayMs);
+          retryAfterResourceShortage();
           return;
         }
         if (state.pendingName && Date.now() - state.pendingSince < 15000) {
@@ -421,10 +543,14 @@
       const pending = state.pendingName ? rows.find((row) => row.name === state.pendingName) : null;
       if (state.confirmAwaiting) {
         await confirmPowerOn();
+        if (state.running) scheduleTick(1000);
         return;
       }
       if (state.manualConfirmPending) {
-        if (findStartDialog()) return;
+        if (findStartDialog()) {
+          scheduleTick(1000);
+          return;
+        }
         state.manualConfirmPending = false;
       }
       if (pending) {
@@ -445,8 +571,7 @@
           closeStartDialog();
           state.pendingName = null;
           state.pendingSince = 0;
-          log(`第 ${state.attempts} 次资源不足，${Math.ceil(settings.retryDelayMs / 1000)} 秒后重试。`, 'wait');
-          scheduleTick(settings.retryDelayMs);
+          retryAfterResourceShortage();
           return;
         }
         if (Date.now() - state.pendingSince < 15000) {
@@ -502,6 +627,10 @@
       scheduleTick();
     } finally {
       state.ticking = false;
+      if (state.tickPending && state.running) {
+        state.tickPending = false;
+        scheduleTick(50);
+      }
     }
   }
 
@@ -515,7 +644,7 @@
   }
 
   async function requestWakeLock() {
-    if (!settings.keepAwake || !state.running || !('wakeLock' in navigator)) return;
+    if (!settings.keepAwake || !state.running || document.hidden || !('wakeLock' in navigator)) return;
     try {
       if (!state.wakeLock || state.wakeLock.released) {
         state.wakeLock = await navigator.wakeLock.request('screen');
@@ -533,11 +662,15 @@
 
   function startKeepAwake() {
     requestWakeLock();
-    document.addEventListener('visibilitychange', requestWakeLock);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', resumeCheck);
+    window.addEventListener('pageshow', resumeCheck);
   }
 
   function stopKeepAwake() {
-    document.removeEventListener('visibilitychange', requestWakeLock);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    window.removeEventListener('focus', resumeCheck);
+    window.removeEventListener('pageshow', resumeCheck);
     clearTimeout(state.wakeLockTimer);
     state.wakeLockTimer = null;
     if (state.wakeLock) state.wakeLock.release().catch(() => {});
@@ -591,12 +724,12 @@
             <label>资源不足后重试（毫秒）<input data-setting="retryDelayMs" type="number" min="5000" max="300000" step="5000"></label>
             <label>自动点击确认<input data-setting="autoConfirm" type="checkbox"></label>
             <label>成功后自动停止<input data-setting="stopOnSuccess" type="checkbox"></label>
-            <label>运行时保持唤醒<input data-setting="keepAwake" type="checkbox"></label>
+            <label>前台时保持屏幕唤醒<input data-setting="keepAwake" type="checkbox"></label>
           </div>
           <div class="status" data-role="status">脚本已加载，默认不会自动点击。</div>
           <div class="log" data-role="log"></div>
           <div class="footer"><span data-role="log-count">0 条</span><button type="button" data-action="toggle-log">查看完整日志</button></div>
-          <div class="hint">只点击目标行可见的“启动/开机/Start”；确认框必须包含目标环境名。Running、Configuring、Error 或实例消失时停止。</div>
+          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。只点击目标行可见的“启动/开机/Start”。</div>
         </div>
       </section>
     `;
@@ -645,12 +778,15 @@
     state.pendingName = null;
     state.pendingSince = 0;
     state.lastActionAt = 0;
+    state.retryNotBefore = 0;
     state.unavailableSince = 0;
     state.unavailableSignature = '';
+    state.tickPending = false;
     state.attempts = 0;
     setControls();
+    const backgroundTimerAvailable = startTimerWorker();
     startKeepAwake();
-    log(`开始抢卡：每 ${settings.intervalMs}ms 检查一次。`, 'action');
+    log(`开始抢卡：每 ${settings.intervalMs}ms 检查一次。${backgroundTimerAvailable ? '后台由 Worker 计时。' : '后台页面可能被浏览器降频。'}`, 'action');
     tick();
   }
 
