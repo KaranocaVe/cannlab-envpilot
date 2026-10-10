@@ -68,8 +68,9 @@ The separate live test is opt-in: set `CANNLAB_RUN_LIVE=1` for read-only checks,
 
 `userscripts/cannlab-card-grabber.user.js` is a Tampermonkey userscript for the
 GitCode CANNLab environment page. It discovers the visible environment rows and
-retries the `Start` flow for the environments you select when the platform
-reports insufficient resources.
+retries the start flow for selected environments when the platform reports
+insufficient resources. It supports both the Chinese page labels `已关机` and
+`启动`/`开机`, and the English labels `Stopped` and `Start`.
 
 1. Install the script from [GitHub Raw](https://raw.githubusercontent.com/KaranocaVe/cannlab-envpilot/main/userscripts/cannlab-card-grabber.user.js) in Tampermonkey.
 2. Open <https://gitcode.com/org/cann/cannlab/environment>.
@@ -80,8 +81,12 @@ The script uses visible DOM buttons only; it does not call CANNLab APIs, replay
 network requests, or create environments. It checks the page every 2.5 seconds
 and waits 30 seconds after an explicit insufficient-resource response before
 retrying. While the selected environment is in a transition state such as
-`Configuring network...`, it waits without clicking Start again. It stops when
-the environment is `Running`, enters `Error`, disappears, or its startup state
-remains ambiguous for too long. The panel includes an attempt counter, a
-collapsible log, auto-confirm and stop-on-success settings, and an optional
-Screen Wake Lock while the retry loop is active.
+`Configuring network...`, it waits without clicking Start again. A confirmation
+dialog is auto-confirmed only when it contains the selected environment name
+and a recognized start action. If a stopped environment has no visible,
+enabled start button for 15 seconds, the script reports that condition and
+stops without submitting a request. It also stops when the environment is
+`Running`, enters `Error`, disappears, or its startup state remains ambiguous
+for too long. The panel includes an attempt counter, a collapsible log,
+auto-confirm and stop-on-success settings, and an optional Screen Wake Lock
+while the retry loop is active.

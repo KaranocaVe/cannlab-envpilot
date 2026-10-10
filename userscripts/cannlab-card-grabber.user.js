@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CANNLab 自动开机/抢卡助手
 // @namespace    https://github.com/KaranocaVe/cannlab-envpilot
-// @version      1.1.0
+// @version      1.2.0
 // @description  自动识别 CANNLab 环境，通过可见按钮循环重试 NPU 开机并在成功或异常状态时停止。
 // @author       KaranocaVe
 // @match        https://gitcode.com/org/cann/cannlab/environment*
@@ -31,9 +31,13 @@
     row: '.table-row.table-grid',
     name: '.env-name',
     status: '.status-text',
-    start: 'button[aria-label="Start"]',
     dialog: '.power-confirm-modal',
   };
+  const START_ACTION_LABEL = /^(?:start(?:\s+(?:instance|environment))?|power\s*on|启动|开机|启动环境|启动实例|开机启动)$/i;
+  const CONFIRM_ACTION_LABEL = /^(?:start(?:\s+(?:instance|environment))?|power\s*on|启动|开机|启动环境|启动实例|确认启动|确认开机|确认|确定|是)$/i;
+  const CANCEL_ACTION_LABEL = /^(?:cancel|取消|暂不|返回)$/i;
+  const START_CONFIRMATION_TEXT = /\bstart\b|\bpower\s*on\b|启动|开机/i;
+  const NO_ACTION_TIMEOUT_MS = 15000;
 
   const settings = loadSettings();
   const state = {
@@ -47,6 +51,8 @@
     confirmAwaiting: false,
     manualConfirmPending: false,
     lastActionAt: 0,
+    unavailableSince: 0,
+    unavailableSignature: '',
     attempts: 0,
     logEntries: [],
     summaryLogs: [],
@@ -103,6 +109,24 @@
     return cleanText(value.split(/\r?\n/)[0]);
   }
 
+  function actionLabels(element) {
+    return [
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.innerText,
+      element.textContent,
+    ].map(cleanText).filter(Boolean);
+  }
+
+  function isDisabled(element) {
+    return Boolean(element?.disabled || element?.getAttribute('aria-disabled') === 'true');
+  }
+
+  function findStartButton(row) {
+    return [...row.querySelectorAll('button, [role="button"], a')]
+      .find((element) => isVisible(element) && actionLabels(element).some((label) => START_ACTION_LABEL.test(label))) || null;
+  }
+
   function getRows() {
     return [...document.querySelectorAll(SELECTORS.row)]
       .filter(isVisible)
@@ -110,7 +134,7 @@
         row,
         name: environmentName(row),
         status: cleanText(row.querySelector(SELECTORS.status)?.textContent),
-        startButton: row.querySelector(SELECTORS.start),
+        startButton: findStartButton(row),
       }))
       .filter((item) => item.name);
   }
@@ -120,15 +144,15 @@
   }
 
   function isTransitionStatus(status) {
-    return /configur|starting|stopping|booting|启动中|配置中|停止中/i.test(cleanText(status));
+    return /configur|starting|stopping|booting|启动中|开机中|配置中|停止中|准备中/i.test(cleanText(status));
   }
 
   function isStoppedStatus(status) {
-    return /^(stopped|已停止|关机)$/i.test(cleanText(status));
+    return /^(stopped|已停止|已关机|关机)$/i.test(cleanText(status));
   }
 
   function isErrorStatus(status) {
-    return /^(error|failed|失败|异常)$/i.test(cleanText(status));
+    return /^(error|failed|启动失败|开机失败|失败|异常)$/i.test(cleanText(status));
   }
 
   function selectedNames() {
@@ -136,36 +160,39 @@
   }
 
   function getVisibleDialogs() {
-    return [...document.querySelectorAll(`${SELECTORS.dialog}, [role="dialog"]`)].filter(isVisible);
+    return [...document.querySelectorAll(`${SELECTORS.dialog}, [role="dialog"], dialog, .ant-modal, .el-dialog, [class*="modal"]`)]
+      .filter(isVisible);
   }
 
   function findStartDialog(targetName = state.pendingName) {
     return getVisibleDialogs().find((dialog) => {
       const text = cleanText(dialog.innerText);
-      return (!targetName || text.includes(targetName))
-        && /Start Instance|Start instance/i.test(text)
-        && [...dialog.querySelectorAll('button')]
-        .some((button) => cleanText(button.innerText) === 'Start');
+      return Boolean(targetName && text.includes(targetName))
+        && START_CONFIRMATION_TEXT.test(text)
+        && [...dialog.querySelectorAll('button, [role="button"]')]
+          .some((button) => isVisible(button) && !isDisabled(button)
+            && actionLabels(button).some((label) => CONFIRM_ACTION_LABEL.test(label)));
     });
   }
 
   function clickElement(element) {
-    if (!element || !isVisible(element) || element.disabled) return false;
+    if (!element || !isVisible(element) || isDisabled(element)) return false;
     element.scrollIntoView({ block: 'center', inline: 'center' });
     element.click();
     return true;
   }
 
-  function clickDialogButton(dialog, label) {
+  function clickDialogButton(dialog, labelPattern) {
     if (!dialog) return false;
-    const button = [...dialog.querySelectorAll('button')]
-      .find((candidate) => cleanText(candidate.innerText) === label);
+    const button = [...dialog.querySelectorAll('button, [role="button"]')]
+      .find((candidate) => isVisible(candidate) && !isDisabled(candidate)
+        && actionLabels(candidate).some((label) => labelPattern.test(label)));
     return clickElement(button);
   }
 
   function closeStartDialog() {
     const dialog = findStartDialog();
-    if (dialog) clickDialogButton(dialog, 'Cancel');
+    if (dialog) clickDialogButton(dialog, CANCEL_ACTION_LABEL);
   }
 
   function resourceErrorVisible() {
@@ -175,7 +202,8 @@
       .concat(cleanText(document.body.innerText))
       .join(' | ')
       .toLowerCase();
-    return visibleText.includes('the current resources are insufficient') || visibleText.includes('当前资源不足');
+    return visibleText.includes('the current resources are insufficient')
+      || /当前资源不足|资源不足|暂无可用资源|没有可用资源/.test(visibleText);
   }
 
   function log(message, kind = 'info') {
@@ -255,7 +283,9 @@
       const name = document.createElement('strong');
       name.textContent = item.name;
       const details = document.createElement('small');
-          details.textContent = item.status || '未知状态';
+      details.textContent = `${item.status || '未知状态'}${isStoppedStatus(item.status)
+        ? (item.startButton && !isDisabled(item.startButton) ? ' · 可启动' : ' · 未识别可用启动按钮')
+        : ''}`;
       meta.append(name, details);
       label.append(checkbox, meta);
       box.appendChild(label);
@@ -298,20 +328,20 @@
         if (!settings.autoConfirm) {
           state.confirmAwaiting = false;
           state.manualConfirmPending = true;
-          log('已点击 Start，等待手动确认。', 'wait');
+          log('已点击启动按钮，等待你手动确认。', 'wait');
           return;
         }
-        if (clickDialogButton(dialog, 'Start')) {
+        if (clickDialogButton(dialog, CONFIRM_ACTION_LABEL)) {
           state.confirmAwaiting = false;
           state.manualConfirmPending = false;
-          log(`已确认 ${state.pendingName}，等待资源结果。`, 'wait');
+          log(`已确认启动 ${state.pendingName}，等待资源结果。`, 'wait');
           return;
         }
       }
       await sleep(150);
     }
     state.confirmAwaiting = false;
-    log('未找到 Start 确认框，本轮不重复提交。', 'warn');
+    log('未找到包含目标环境名的启动确认框，本轮不会重复提交。', 'warn');
   }
 
   function stop(reason = '已停止') {
@@ -334,7 +364,7 @@
   }
 
   function chooseCandidate(rows) {
-    return rows.find((row) => isStoppedStatus(row.status) && row.startButton && !row.startButton.disabled);
+    return rows.find((row) => isStoppedStatus(row.status) && row.startButton && !isDisabled(row.startButton));
   }
 
   async function submitCandidate(candidate) {
@@ -350,7 +380,7 @@
       state.pendingName = null;
       return false;
     }
-    log(`第 ${state.attempts} 次：已点击 ${candidate.name} 的 Start。`, 'action');
+    log(`第 ${state.attempts} 次：已点击 ${candidate.name} 的启动按钮。`, 'action');
     await confirmPowerOn();
     scheduleTick(Math.max(250, Number(settings.retryDelayMs) || DEFAULTS.retryDelayMs));
     return true;
@@ -423,7 +453,7 @@
           scheduleTick(1000);
           return;
         }
-        stop(`${pending.name} 点击确认后仍显示 Stopped，且页面没有资源不足提示；为避免重复提交，脚本已停止。`);
+        stop(`${pending.name} 点击确认后仍显示「${pending.status}」，且页面没有资源不足提示；为避免重复提交，脚本已停止。`);
         return;
       }
 
@@ -440,10 +470,31 @@
 
       const candidate = chooseCandidate(rows);
       if (!candidate) {
-        setPanelStatus(`等待目标变为 Stopped；已尝试 ${state.attempts} 次。`, 'wait');
+        const stoppedRows = rows.filter((row) => isStoppedStatus(row.status));
+        if (stoppedRows.length) {
+          const signature = stoppedRows.map((row) => `${row.name}:${row.startButton ? 'disabled' : 'missing'}`).join('|');
+          if (signature !== state.unavailableSignature) {
+            state.unavailableSignature = signature;
+            state.unavailableSince = Date.now();
+          }
+          const unavailable = stoppedRows[0];
+          const reason = unavailable.startButton ? '行内启动按钮当前不可用' : '未找到可见的“启动/开机/Start”按钮';
+          if (Date.now() - state.unavailableSince >= NO_ACTION_TIMEOUT_MS) {
+            stop(`${unavailable.name} 已关机，但${reason}；连续 ${NO_ACTION_TIMEOUT_MS / 1000} 秒未恢复，未发送启动请求。`);
+            return;
+          }
+          setPanelStatus(`${unavailable.name} 已关机，但${reason}；继续检查页面，已尝试 ${state.attempts} 次。`, 'warn');
+        } else {
+          state.unavailableSince = 0;
+          state.unavailableSignature = '';
+          const statuses = rows.map((row) => `${row.name}：${row.status || '未知状态'}`).join('；');
+          setPanelStatus(`等待目标进入可操作状态（${statuses}）；已尝试 ${state.attempts} 次。`, 'wait');
+        }
         scheduleTick();
         return;
       }
+      state.unavailableSince = 0;
+      state.unavailableSignature = '';
       await submitCandidate(candidate);
     } catch (error) {
       console.error('[CANNLab 抢卡助手] 运行异常', error);
@@ -545,7 +596,7 @@
           <div class="status" data-role="status">脚本已加载，默认不会自动点击。</div>
           <div class="log" data-role="log"></div>
           <div class="footer"><span data-role="log-count">0 条</span><button type="button" data-action="toggle-log">查看完整日志</button></div>
-          <div class="hint">只点击目标行的可见 Start；Running、Configuring、Error 或实例消失时停止。</div>
+          <div class="hint">只点击目标行可见的“启动/开机/Start”；确认框必须包含目标环境名。Running、Configuring、Error 或实例消失时停止。</div>
         </div>
       </section>
     `;
@@ -594,6 +645,8 @@
     state.pendingName = null;
     state.pendingSince = 0;
     state.lastActionAt = 0;
+    state.unavailableSince = 0;
+    state.unavailableSignature = '';
     state.attempts = 0;
     setControls();
     startKeepAwake();
