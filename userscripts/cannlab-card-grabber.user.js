@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CANNLab 自动开机/抢卡助手
 // @namespace    https://github.com/KaranocaVe/cannlab-envpilot
-// @version      1.5.2
-// @description  自动识别 CANNLab 环境；资源不足时重试，Error 时停止恢复后继续启动。
+// @version      1.5.3
+// @description  持续尝试启动选中的 CANNLab 环境，成功或手动停止后结束。
 // @author       KaranocaVe
 // @match        https://gitcode.com/org/cann/cannlab/environment*
 // @updateURL    https://raw.githubusercontent.com/KaranocaVe/cannlab-envpilot/main/userscripts/cannlab-card-grabber.user.js
@@ -78,6 +78,7 @@
     lastActionAt: 0,
     unavailableSince: 0,
     unavailableSignature: '',
+    targetMissingSince: 0,
     attempts: 0,
     logEntries: [],
     summaryLogs: [],
@@ -486,6 +487,22 @@
     scheduleTick(delay);
   }
 
+  function retryStartSoon(reason) {
+    const delay = Math.max(1500, Number(settings.intervalMs) || DEFAULTS.intervalMs);
+    state.retryNotBefore = Date.now() + delay;
+    log(`${reason}，${Math.ceil(delay / 1000)} 秒后继续尝试启动。`, 'wait');
+    scheduleTick(delay);
+  }
+
+  function clearPendingStart() {
+    state.pendingName = null;
+    state.pendingSince = 0;
+    state.pendingResourceNoticeBaseline = new Set();
+    state.resourceShortageSeen = false;
+    state.confirmAwaiting = false;
+    state.manualConfirmPending = false;
+  }
+
   function resumeCheck() {
     if (state.running) scheduleTick(50);
   }
@@ -554,21 +571,18 @@
       closeStartDialog(item.name);
       const stopButton = item.stopButton || findStopButton(item.row);
       if (!stopButton || isDisabled(stopButton)) {
-        stop(`${item.name} 处于 Error，但页面没有可用的 Stop/关机按钮；脚本已停止。`);
+        setPanelStatus(`${item.name} 处于 Error，暂时没有可用的 Stop/关机按钮；继续检查，按钮恢复后会处理。`, 'warn');
+        scheduleTick(1000);
         return;
       }
       state.recoveryName = item.name;
       state.recoverySince = Date.now();
-      state.pendingName = null;
-      state.pendingSince = 0;
-      state.pendingResourceNoticeBaseline = new Set();
-      state.resourceShortageSeen = false;
-      state.confirmAwaiting = false;
-      state.manualConfirmPending = false;
+      clearPendingStart();
       state.stopDialogBaseline = new Set(getVisibleDialogs());
       if (!clickElement(stopButton)) {
         clearErrorRecovery();
-        stop(`${item.name} 的 Stop/关机按钮不可用，脚本已停止。`);
+        log(`${item.name} 的 Stop/关机按钮暂不可用，稍后重新检查。`, 'warn');
+        scheduleTick(1000);
         return;
       }
       log(`${item.name} 处于 Error，已点击 Stop，等待状态恢复。`, 'action');
@@ -579,19 +593,19 @@
     }
 
     if (state.recoveryName !== item.name) {
-      stop(`正在恢复 ${state.recoveryName}，检测到另一个 Error 目标 ${item.name}；脚本已停止。`);
+      setPanelStatus(`当前先恢复 ${state.recoveryName}；${item.name} 也处于 Error，稍后继续处理。`, 'warn');
+      scheduleTick(1000);
       return;
     }
     if (isStoppedStatus(item.status)) {
       clearErrorRecovery();
-      state.pendingName = null;
-      state.pendingSince = 0;
+      clearPendingStart();
       retryStartAfter('Error 环境已恢复');
       return;
     }
     if (Date.now() - state.recoverySince >= 30_000) {
-      stop(`${item.name} 点击 Stop 后 30 秒仍未回到已关机状态；脚本停止，不会重复点击。`);
-      return;
+      log(`${item.name} 点击 Stop 后仍未回到已关机状态，继续等待恢复。`, 'warn');
+      state.recoverySince = Date.now();
     }
     const status = item.status || '未知状态';
     setPanelStatus(`${item.name} 已请求 Stop，当前状态「${status}」；等待环境重置后重试。`, 'wait');
@@ -601,12 +615,7 @@
   function stop(reason = '已停止') {
     state.running = false;
     state.ticking = false;
-    state.pendingName = null;
-    state.pendingSince = 0;
-    state.pendingResourceNoticeBaseline = new Set();
-    state.resourceShortageSeen = false;
-    state.confirmAwaiting = false;
-    state.manualConfirmPending = false;
+    clearPendingStart();
     clearErrorRecovery();
     state.tickPending = false;
     cancelScheduledTick();
@@ -637,7 +646,9 @@
     state.resourceShortageSeen = false;
     state.confirmAwaiting = clickElement(candidate.startButton);
     if (!state.confirmAwaiting) {
-      state.pendingName = null;
+      clearPendingStart();
+      log(`${candidate.name} 的启动按钮刚刚不可用，稍后继续尝试。`, 'warn');
+      scheduleTick(interval);
       return false;
     }
     log(`第 ${state.attempts} 次：已点击 ${candidate.name} 的启动按钮。`, 'action');
@@ -656,13 +667,16 @@
     try {
       const rows = targetRows();
       if (!rows.length) {
-        if (state.pendingName && Date.now() - state.pendingSince < 15000) {
-          scheduleTick(1000);
-          return;
+        if (!state.targetMissingSince) state.targetMissingSince = Date.now();
+        if (Date.now() - state.targetMissingSince >= NO_ACTION_TIMEOUT_MS) {
+          log('暂时找不到已选目标环境，继续检查页面，环境重新出现后会继续启动。', 'warn');
+          state.targetMissingSince = Date.now();
         }
-        stop('没有找到已选目标环境，已停止。');
+        setPanelStatus('暂时没有识别到已选目标环境，继续检查页面。', 'wait');
+        scheduleTick();
         return;
       }
+      state.targetMissingSince = 0;
 
       const success = rows.find((row) => isSuccessStatus(row.status));
       if (success) {
@@ -686,7 +700,8 @@
       if (state.recoveryName) {
         const recovering = rows.find((row) => row.name === state.recoveryName);
         if (!recovering) {
-          stop(`找不到正在恢复的环境 ${state.recoveryName}，脚本已停止。`);
+          setPanelStatus(`暂时找不到正在恢复的环境 ${state.recoveryName}，继续检查页面。`, 'warn');
+          scheduleTick();
           return;
         }
         await recoverError(recovering);
@@ -709,10 +724,10 @@
       if (pending) {
         if (isTransitionStatus(pending.status) || isSuccessStatus(pending.status)) {
           if (Date.now() - state.pendingSince > 10 * 60 * 1000) {
-            stop(`${pending.name} 的启动状态持续超过 10 分钟，请检查页面后再重试。`);
-            return;
+            setPanelStatus(`${pending.name} 仍处于「${pending.status}」，继续等待状态更新。`, 'warn');
+          } else {
+            log(`${pending.name}：${pending.status}，等待页面更新。`, 'wait');
           }
-          log(`${pending.name}：${pending.status}，等待页面更新。`, 'wait');
           scheduleTick();
           return;
         }
@@ -725,19 +740,13 @@
           if (hasNewResourceShortageNotice()) state.resourceShortageSeen = true;
           if (state.resourceShortageSeen) {
             if (startDialog) closeStartDialog(pending.name);
-            state.pendingName = null;
-            state.pendingSince = 0;
-            state.pendingResourceNoticeBaseline = new Set();
-            state.resourceShortageSeen = false;
-            state.confirmAwaiting = false;
-            state.manualConfirmPending = false;
+            clearPendingStart();
             retryStartAfter(`${pending.name} 收到明确的资源不足提示`);
             return;
           }
           if (isStartSubmissionInProgress(startDialog)) {
             if (Date.now() - state.pendingSince > 10 * 60 * 1000) {
-              stop(`${pending.name} 的启动请求持续超过 10 分钟，请检查页面后再试。`);
-              return;
+              setPanelStatus(`${pending.name} 的启动请求仍在处理中，继续等待结果。`, 'warn');
             }
             scheduleTick(1000);
             return;
@@ -747,20 +756,24 @@
             return;
           }
           if (startDialog) closeStartDialog(pending.name);
-          stop(`${pending.name} 启动后仍为 Stopped，未检测到新的资源不足提示；脚本已停止，不会自动重试。`);
+          const name = pending.name;
+          clearPendingStart();
+          retryStartSoon(`${name} 仍为 Stopped，继续尝试启动`);
           return;
         }
         if (Date.now() - state.pendingSince < 15000) {
           scheduleTick(1000);
           return;
         }
-        stop(`${pending.name} 点击确认后仍显示「${pending.status}」；为避免重复提交，脚本已停止。`);
+        setPanelStatus(`${pending.name} 点击确认后状态为「${pending.status}」，继续检查并等待可操作状态。`, 'warn');
+        scheduleTick();
         return;
       }
 
       const transition = rows.find((row) => isTransitionStatus(row.status));
       if (transition) {
-        stop(`${transition.name} 进入过渡状态「${transition.status}」，脚本停止轮询。`);
+        setPanelStatus(`${transition.name} 处于过渡状态「${transition.status}」，等待结果后继续。`, 'wait');
+        scheduleTick();
         return;
       }
       const error = rows.find((row) => isErrorStatus(row.status));
@@ -781,10 +794,11 @@
           const unavailable = stoppedRows[0];
           const reason = unavailable.startButton ? '行内启动按钮当前不可用' : '未找到可见的“启动/开机/Start”按钮';
           if (Date.now() - state.unavailableSince >= NO_ACTION_TIMEOUT_MS) {
-            stop(`${unavailable.name} 已关机，但${reason}；连续 ${NO_ACTION_TIMEOUT_MS / 1000} 秒未恢复，未发送启动请求。`);
-            return;
+            log(`${unavailable.name} 已关机，但${reason}；继续检查，按钮恢复后会尝试启动。`, 'warn');
+            state.unavailableSince = Date.now();
+          } else {
+            setPanelStatus(`${unavailable.name} 已关机，但${reason}；继续检查页面，已尝试 ${state.attempts} 次。`, 'warn');
           }
-          setPanelStatus(`${unavailable.name} 已关机，但${reason}；继续检查页面，已尝试 ${state.attempts} 次。`, 'warn');
         } else {
           state.unavailableSince = 0;
           state.unavailableSignature = '';
@@ -897,7 +911,7 @@
           <div class="target-list" data-role="targets"></div>
           <div class="settings">
             <label>检查间隔（毫秒）<input data-setting="intervalMs" type="number" min="1500" max="60000" step="500"></label>
-            <label>启动失败后重试（毫秒）<input data-setting="retryDelayMs" type="number" min="5000" max="300000" step="5000"></label>
+            <label>资源不足/错误恢复后重试（毫秒）<input data-setting="retryDelayMs" type="number" min="5000" max="300000" step="5000"></label>
             <label>自动点击确认<input data-setting="autoConfirm" type="checkbox"></label>
             <label>成功后自动停止<input data-setting="stopOnSuccess" type="checkbox"></label>
             <label>前台时保持屏幕唤醒<input data-setting="keepAwake" type="checkbox"></label>
@@ -905,7 +919,7 @@
           <div class="status" data-role="status">脚本已加载，默认不会自动点击。</div>
           <div class="log" data-role="log"></div>
           <div class="footer"><span data-role="log-count">0 条</span><button type="button" data-action="toggle-log">查看完整日志</button></div>
-          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。遇到 Error 时会点目标行 Stop/关机，恢复已关机后继续重试。Start 后只有检测到新的“资源不足”提示才会按重试间隔再试；普通已关机状态不会自动反复启动。</div>
+          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。遇到 Error 时会点目标行 Stop/关机，恢复后继续启动。启动失败会持续重试：明确提示资源不足时按失败间隔，其余仍已关机时按检查间隔；环境或按钮暂不可用时继续等待。成功后按设置自动停止。</div>
         </div>
       </section>
     `;
@@ -958,6 +972,7 @@
     state.retryNotBefore = 0;
     state.unavailableSince = 0;
     state.unavailableSignature = '';
+    state.targetMissingSince = 0;
     state.tickPending = false;
     state.attempts = 0;
     setControls();

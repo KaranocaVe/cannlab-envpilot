@@ -83,24 +83,22 @@ then auto-confirms only a fresh dialog opened by that click and containing a
 recognized Stop action. The dialog may omit the environment name because the
 target is established by the row whose Stop button was clicked. It then waits
 for the status to return to `Stopped`/`已关机`. After the
-configured retry delay (30 seconds by default), it tries to start again. If Stop
-is unavailable, the confirmation cannot be matched, or the environment does not
-return to a stopped state within 30 seconds, the script stops and reports the
-condition. After submitting Start, the script checks the result every second.
-It closes a leftover start dialog and retries after the configured delay only
-when a new visible notification explicitly says resources are insufficient
-(such as `当前资源不足，请稍后重试`). If the environment remains `Stopped`
-without that notification for 5 seconds, it closes the stale dialog and stops
-instead of retrying. Existing notifications from before the Start attempt do
-not count. While an environment is in a transition state such as
-`Configuring network...`, it waits without clicking Start again. A start
-confirmation dialog is likewise auto-confirmed only when it contains the
-selected environment name and a recognized start action. If a stopped
-environment has no visible, enabled start button for 15 seconds, the script
-reports that condition and stops without submitting a request. The panel
-includes an attempt counter, a collapsible log, auto-confirm and stop-on-success
-settings, and an optional Screen Wake Lock while the page is in the foreground.
-A dedicated Worker schedules background checks where the browser allows it,
-and returning to the tab triggers an immediate check. Browsers may still freeze
-or discard a hidden page; no userscript can keep running after that happens, so
+configured retry delay (30 seconds by default), it tries to start again. When
+Stop is temporarily unavailable or the environment has not yet returned to
+`Stopped`, the script keeps checking until recovery becomes possible. After
+submitting Start, it checks the result every second. A new visible notification
+that explicitly says resources are insufficient (such as
+`当前资源不足，请稍后重试`) uses the configured retry delay. If the environment
+is still `Stopped` after five seconds without that notification, it closes a
+leftover start dialog and retries after the normal check interval. Existing
+notifications from before the Start attempt do not count. Other transitional or
+unknown states, a temporarily missing target row, and an unavailable Start
+button keep the script running; it waits and resumes when the page becomes
+actionable. It does not stop on a failed attempt. It stops on success when
+stop-on-success is enabled, or when you press Stop. The panel includes an
+attempt counter, a collapsible log, auto-confirm and stop-on-success settings,
+and an optional Screen Wake Lock while the page is in the foreground. A
+dedicated Worker schedules background checks where the browser allows it, and
+returning to the tab triggers an immediate check. Browsers may still freeze or
+discard a hidden page; no userscript can keep running after that happens, so
 foreground operation is the reliable mode.
