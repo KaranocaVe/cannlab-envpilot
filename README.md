@@ -84,9 +84,13 @@ Stop action, then waits for the status to return to `Stopped`/`已关机`. After
 configured retry delay (30 seconds by default), it tries to start again. If Stop
 is unavailable, the confirmation cannot be matched, or the environment does not
 return to a stopped state within 30 seconds, the script stops and reports the
-condition. If a start confirmation leaves the environment `Stopped`, it closes
-the stale dialog and retries after the configured delay. While an environment
-is in a transition state such as
+condition. After submitting Start, the script checks the result every second.
+It closes a leftover start dialog and retries after the configured delay only
+when a new visible notification explicitly says resources are insufficient
+(such as `当前资源不足，请稍后重试`). If the environment remains `Stopped`
+without that notification for 5 seconds, it closes the stale dialog and stops
+instead of retrying. Existing notifications from before the Start attempt do
+not count. While an environment is in a transition state such as
 `Configuring network...`, it waits without clicking Start again. A start
 confirmation dialog is likewise auto-confirmed only when it contains the
 selected environment name and a recognized start action. If a stopped

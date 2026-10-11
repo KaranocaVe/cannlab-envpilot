@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CANNLab 自动开机/抢卡助手
 // @namespace    https://github.com/KaranocaVe/cannlab-envpilot
-// @version      1.5.0
-// @description  自动识别 CANNLab 环境，遇到 Error 时先停止目标环境，恢复后继续重试开机。
+// @version      1.5.1
+// @description  自动识别 CANNLab 环境；仅在明确提示资源不足时重试，Error 时先停止再恢复。
 // @author       KaranocaVe
 // @match        https://gitcode.com/org/cann/cannlab/environment*
 // @updateURL    https://raw.githubusercontent.com/KaranocaVe/cannlab-envpilot/main/userscripts/cannlab-card-grabber.user.js
@@ -41,6 +41,17 @@
   const START_CONFIRMATION_TEXT = /\bstart\b|\bpower\s*on\b|启动|开机/i;
   const STOP_CONFIRMATION_TEXT = /\bstop\b|\bpower\s*off\b|关机|停止/i;
   const NO_ACTION_TIMEOUT_MS = 15000;
+  const START_RESULT_TIMEOUT_MS = 5000;
+  const RESOURCE_SHORTAGE_TEXT = /(?:当前\s*)?资源不足|resources?\s+(?:are\s+)?(?:insufficient|unavailable)|insufficient\s+resources/i;
+  const RESOURCE_NOTICE_SELECTORS = [
+    '[role="alert"]',
+    '[role="status"]',
+    '[aria-live]',
+    '[class*="toast" i]',
+    '[class*="message" i]',
+    '[class*="notification" i]',
+    '[class*="snackbar" i]',
+  ].join(', ');
 
   const settings = loadSettings();
   const state = {
@@ -56,6 +67,8 @@
     observer: null,
     pendingName: null,
     pendingSince: 0,
+    pendingResourceNoticeBaseline: new Set(),
+    resourceShortageSeen: false,
     confirmAwaiting: false,
     manualConfirmPending: false,
     manualStopConfirmPending: false,
@@ -113,6 +126,17 @@
       && style.opacity !== '0'
       && rect.width > 0
       && rect.height > 0;
+  }
+
+  function resourceShortageNotices() {
+    return [...document.querySelectorAll(RESOURCE_NOTICE_SELECTORS)]
+      .filter(isVisible)
+      .filter((element) => RESOURCE_SHORTAGE_TEXT.test(cleanText(element.innerText || element.textContent)));
+  }
+
+  function hasNewResourceShortageNotice() {
+    return resourceShortageNotices()
+      .some((element) => !state.pendingResourceNoticeBaseline.has(element));
   }
 
   function environmentName(row) {
@@ -539,6 +563,8 @@
       state.recoverySince = Date.now();
       state.pendingName = null;
       state.pendingSince = 0;
+      state.pendingResourceNoticeBaseline = new Set();
+      state.resourceShortageSeen = false;
       state.confirmAwaiting = false;
       state.manualConfirmPending = false;
       if (!clickElement(stopButton)) {
@@ -578,6 +604,8 @@
     state.ticking = false;
     state.pendingName = null;
     state.pendingSince = 0;
+    state.pendingResourceNoticeBaseline = new Set();
+    state.resourceShortageSeen = false;
     state.confirmAwaiting = false;
     state.manualConfirmPending = false;
     clearErrorRecovery();
@@ -606,6 +634,8 @@
     state.attempts += 1;
     state.pendingName = candidate.name;
     state.pendingSince = now;
+    state.pendingResourceNoticeBaseline = new Set(resourceShortageNotices());
+    state.resourceShortageSeen = false;
     state.confirmAwaiting = clickElement(candidate.startButton);
     if (!state.confirmAwaiting) {
       state.pendingName = null;
@@ -613,7 +643,7 @@
     }
     log(`第 ${state.attempts} 次：已点击 ${candidate.name} 的启动按钮。`, 'action');
     await confirmPowerOn();
-    if (state.running) scheduleTick(Math.max(250, Number(settings.retryDelayMs) || DEFAULTS.retryDelayMs));
+    if (state.running) scheduleTick(1000);
     return true;
   }
 
@@ -693,7 +723,19 @@
         }
         if (isStoppedStatus(pending.status)) {
           const startDialog = findStartConfirmationDialog(pending.name);
-          if (Date.now() - state.pendingSince < 15000 || isStartSubmissionInProgress(startDialog)) {
+          if (hasNewResourceShortageNotice()) state.resourceShortageSeen = true;
+          if (state.resourceShortageSeen) {
+            if (startDialog) closeStartDialog(pending.name);
+            state.pendingName = null;
+            state.pendingSince = 0;
+            state.pendingResourceNoticeBaseline = new Set();
+            state.resourceShortageSeen = false;
+            state.confirmAwaiting = false;
+            state.manualConfirmPending = false;
+            retryStartAfter(`${pending.name} 收到明确的资源不足提示`);
+            return;
+          }
+          if (isStartSubmissionInProgress(startDialog)) {
             if (Date.now() - state.pendingSince > 10 * 60 * 1000) {
               stop(`${pending.name} 的启动请求持续超过 10 分钟，请检查页面后再试。`);
               return;
@@ -701,12 +743,12 @@
             scheduleTick(1000);
             return;
           }
+          if (Date.now() - state.pendingSince < START_RESULT_TIMEOUT_MS) {
+            scheduleTick(1000);
+            return;
+          }
           if (startDialog) closeStartDialog(pending.name);
-          state.pendingName = null;
-          state.pendingSince = 0;
-          state.confirmAwaiting = false;
-          state.manualConfirmPending = false;
-          retryStartAfter(`${pending.name} 仍为 Stopped`);
+          stop(`${pending.name} 启动后仍为 Stopped，未检测到新的资源不足提示；脚本已停止，不会自动重试。`);
           return;
         }
         if (Date.now() - state.pendingSince < 15000) {
@@ -864,7 +906,7 @@
           <div class="status" data-role="status">脚本已加载，默认不会自动点击。</div>
           <div class="log" data-role="log"></div>
           <div class="footer"><span data-role="log-count">0 条</span><button type="button" data-action="toggle-log">查看完整日志</button></div>
-          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。遇到 Error 时会点目标行 Stop/关机，等恢复已关机后按重试间隔再启动；Start 后状态仍为已关机也会等待后重试。</div>
+          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。遇到 Error 时会点目标行 Stop/关机，恢复已关机后继续重试。Start 后只有检测到新的“资源不足”提示才会按重试间隔再试；普通已关机状态不会自动反复启动。</div>
         </div>
       </section>
     `;
