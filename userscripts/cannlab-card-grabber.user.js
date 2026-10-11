@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CANNLab 自动开机/抢卡助手
 // @namespace    https://github.com/KaranocaVe/cannlab-envpilot
-// @version      1.3.0
-// @description  自动识别 CANNLab 环境，通过可见按钮循环重试 NPU 开机并在成功或异常状态时停止。
+// @version      1.5.0
+// @description  自动识别 CANNLab 环境，遇到 Error 时先停止目标环境，恢复后继续重试开机。
 // @author       KaranocaVe
 // @match        https://gitcode.com/org/cann/cannlab/environment*
 // @updateURL    https://raw.githubusercontent.com/KaranocaVe/cannlab-envpilot/main/userscripts/cannlab-card-grabber.user.js
@@ -36,7 +36,10 @@
   const START_ACTION_LABEL = /^(?:start(?:\s+(?:instance|environment))?|power\s*on|启动|开机|启动环境|启动实例|开机启动)$/i;
   const CONFIRM_ACTION_LABEL = /^(?:start(?:\s+(?:instance|environment))?|power\s*on|启动|开机|启动环境|启动实例|确认启动|确认开机|确认|确定|是)$/i;
   const CANCEL_ACTION_LABEL = /^(?:cancel|取消|暂不|返回)$/i;
+  const STOP_ACTION_LABEL = /^(?:stop(?:\s+(?:instance|environment))?|power\s*off|关机|停止|停止环境|停止实例)$/i;
+  const STOP_CONFIRM_ACTION_LABEL = /^(?:stop(?:\s+(?:instance|environment))?|power\s*off|关机|停止|confirm|ok|确定|确认|yes|是)$/i;
   const START_CONFIRMATION_TEXT = /\bstart\b|\bpower\s*on\b|启动|开机/i;
+  const STOP_CONFIRMATION_TEXT = /\bstop\b|\bpower\s*off\b|关机|停止/i;
   const NO_ACTION_TIMEOUT_MS = 15000;
 
   const settings = loadSettings();
@@ -55,6 +58,9 @@
     pendingSince: 0,
     confirmAwaiting: false,
     manualConfirmPending: false,
+    manualStopConfirmPending: false,
+    recoveryName: null,
+    recoverySince: 0,
     lastActionAt: 0,
     unavailableSince: 0,
     unavailableSignature: '',
@@ -132,6 +138,11 @@
       .find((element) => isVisible(element) && actionLabels(element).some((label) => START_ACTION_LABEL.test(label))) || null;
   }
 
+  function findStopButton(row) {
+    return [...row.querySelectorAll('button, [role="button"], a')]
+      .find((element) => isVisible(element) && actionLabels(element).some((label) => STOP_ACTION_LABEL.test(label))) || null;
+  }
+
   function getRows() {
     return [...document.querySelectorAll(SELECTORS.row)]
       .filter(isVisible)
@@ -140,6 +151,7 @@
         name: environmentName(row),
         status: cleanText(row.querySelector(SELECTORS.status)?.textContent),
         startButton: findStartButton(row),
+        stopButton: findStopButton(row),
       }))
       .filter((item) => item.name);
   }
@@ -169,6 +181,14 @@
       .filter(isVisible);
   }
 
+  function findStartConfirmationDialog(targetName = state.pendingName) {
+    return getVisibleDialogs().find((dialog) => {
+      const text = cleanText(dialog.innerText);
+      return Boolean(targetName && text.includes(targetName))
+        && START_CONFIRMATION_TEXT.test(text);
+    });
+  }
+
   function findStartDialog(targetName = state.pendingName) {
     return getVisibleDialogs().find((dialog) => {
       const text = cleanText(dialog.innerText);
@@ -177,6 +197,31 @@
         && [...dialog.querySelectorAll('button, [role="button"]')]
           .some((button) => isVisible(button) && !isDisabled(button)
             && actionLabels(button).some((label) => CONFIRM_ACTION_LABEL.test(label)));
+    });
+  }
+
+  function closeStartDialog(targetName = state.pendingName) {
+    const dialog = findStartConfirmationDialog(targetName);
+    if (dialog) clickDialogButton(dialog, CANCEL_ACTION_LABEL);
+  }
+
+  function isStartSubmissionInProgress(dialog) {
+    const button = [...(dialog?.querySelectorAll('button, [role="button"]') || [])]
+      .find((candidate) => actionLabels(candidate).some((label) => START_ACTION_LABEL.test(label)));
+    return Boolean(button && (isDisabled(button)
+      || button.getAttribute('aria-busy') === 'true'
+      || button.hasAttribute('loading')
+      || button.querySelector('svg, img, [class*="loading"], [class*="spin"]')));
+  }
+
+  function findStopDialog(targetName = state.recoveryName) {
+    return getVisibleDialogs().find((dialog) => {
+      const text = cleanText(dialog.innerText);
+      return Boolean(targetName && text.includes(targetName))
+        && STOP_CONFIRMATION_TEXT.test(text)
+        && [...dialog.querySelectorAll('button, [role="button"]')]
+          .some((button) => isVisible(button) && !isDisabled(button)
+            && actionLabels(button).some((label) => STOP_CONFIRM_ACTION_LABEL.test(label)));
     });
   }
 
@@ -193,22 +238,6 @@
       .find((candidate) => isVisible(candidate) && !isDisabled(candidate)
         && actionLabels(candidate).some((label) => labelPattern.test(label)));
     return clickElement(button);
-  }
-
-  function closeStartDialog() {
-    const dialog = findStartDialog();
-    if (dialog) clickDialogButton(dialog, CANCEL_ACTION_LABEL);
-  }
-
-  function resourceErrorVisible() {
-    const visibleText = [...document.querySelectorAll('[role="alert"], [role="status"], [aria-live], [class*="toast"], [class*="notification"]')]
-      .filter(isVisible)
-      .map((node) => cleanText(node.innerText))
-      .concat(cleanText(document.body.innerText))
-      .join(' | ')
-      .toLowerCase();
-    return visibleText.includes('the current resources are insufficient')
-      || /当前资源不足|资源不足|暂无可用资源|没有可用资源/.test(visibleText);
   }
 
   function log(message, kind = 'info') {
@@ -422,10 +451,10 @@
     }
   }
 
-  function retryAfterResourceShortage() {
+  function retryStartAfter(reason) {
     const delay = Math.max(5000, Number(settings.retryDelayMs) || DEFAULTS.retryDelayMs);
     state.retryNotBefore = Date.now() + delay;
-    log(`第 ${state.attempts} 次资源不足，${Math.ceil(delay / 1000)} 秒后重试。`, 'wait');
+    log(`${reason}，${Math.ceil(delay / 1000)} 秒后再次尝试启动。`, 'wait');
     scheduleTick(delay);
   }
 
@@ -462,6 +491,88 @@
     log('未找到包含目标环境名的启动确认框，本轮不会重复提交。', 'warn');
   }
 
+  async function confirmPowerOff(targetName) {
+    const deadline = Date.now() + 2500;
+    while (state.running && Date.now() < deadline) {
+      const dialog = getVisibleDialogs().find((candidate) =>
+        STOP_CONFIRMATION_TEXT.test(cleanText(candidate.innerText)));
+      if (dialog) {
+        const text = cleanText(dialog.innerText);
+        if (!text.includes(targetName)) {
+          stop(`停止确认框中无法核对目标环境 ${targetName}，脚本已停止。`);
+          return false;
+        }
+        if (!findStopDialog(targetName)) {
+          stop(`${targetName} 的停止确认框没有可识别的确认按钮，脚本已停止；请检查页面。`);
+          return false;
+        }
+        if (!settings.autoConfirm) {
+          state.manualStopConfirmPending = true;
+          log(`已点击 ${targetName} 的 Stop，等待你确认停止后继续重试。`, 'wait');
+          return false;
+        }
+        if (clickDialogButton(dialog, STOP_CONFIRM_ACTION_LABEL)) {
+          log(`已确认停止 ${targetName}，等待环境恢复到已关机状态。`, 'wait');
+          return true;
+        }
+      }
+      await sleep(150);
+    }
+    return true;
+  }
+
+  function clearErrorRecovery() {
+    state.recoveryName = null;
+    state.recoverySince = 0;
+    state.manualStopConfirmPending = false;
+  }
+
+  async function recoverError(item) {
+    if (!state.recoveryName) {
+      closeStartDialog(item.name);
+      const stopButton = item.stopButton || findStopButton(item.row);
+      if (!stopButton || isDisabled(stopButton)) {
+        stop(`${item.name} 处于 Error，但页面没有可用的 Stop/关机按钮；脚本已停止。`);
+        return;
+      }
+      state.recoveryName = item.name;
+      state.recoverySince = Date.now();
+      state.pendingName = null;
+      state.pendingSince = 0;
+      state.confirmAwaiting = false;
+      state.manualConfirmPending = false;
+      if (!clickElement(stopButton)) {
+        clearErrorRecovery();
+        stop(`${item.name} 的 Stop/关机按钮不可用，脚本已停止。`);
+        return;
+      }
+      log(`${item.name} 处于 Error，已点击 Stop，等待状态恢复。`, 'action');
+      const confirmed = await confirmPowerOff(item.name);
+      if (!state.running) return;
+      if (confirmed || state.manualStopConfirmPending) scheduleTick(1000);
+      return;
+    }
+
+    if (state.recoveryName !== item.name) {
+      stop(`正在恢复 ${state.recoveryName}，检测到另一个 Error 目标 ${item.name}；脚本已停止。`);
+      return;
+    }
+    if (isStoppedStatus(item.status)) {
+      clearErrorRecovery();
+      state.pendingName = null;
+      state.pendingSince = 0;
+      retryStartAfter('Error 环境已恢复');
+      return;
+    }
+    if (Date.now() - state.recoverySince >= 30_000) {
+      stop(`${item.name} 点击 Stop 后 30 秒仍未回到已关机状态；脚本停止，不会重复点击。`);
+      return;
+    }
+    const status = item.status || '未知状态';
+    setPanelStatus(`${item.name} 已请求 Stop，当前状态「${status}」；等待环境重置后重试。`, 'wait');
+    scheduleTick(1000);
+  }
+
   function stop(reason = '已停止') {
     state.running = false;
     state.ticking = false;
@@ -469,6 +580,7 @@
     state.pendingSince = 0;
     state.confirmAwaiting = false;
     state.manualConfirmPending = false;
+    clearErrorRecovery();
     state.tickPending = false;
     cancelScheduledTick();
     stopTimerWorker();
@@ -515,13 +627,6 @@
     try {
       const rows = targetRows();
       if (!rows.length) {
-        if (state.pendingName && resourceErrorVisible()) {
-          closeStartDialog();
-          state.pendingName = null;
-          state.pendingSince = 0;
-          retryAfterResourceShortage();
-          return;
-        }
         if (state.pendingName && Date.now() - state.pendingSince < 15000) {
           scheduleTick(1000);
           return;
@@ -538,6 +643,25 @@
           return;
         }
         log(`${success.name} 已 ${success.status}。`, 'success');
+      }
+
+      if (state.manualStopConfirmPending) {
+        const dialog = findStopDialog(state.recoveryName);
+        if (dialog) {
+          setPanelStatus(`等待你确认 ${state.recoveryName} 的 Stop，确认后将继续重试。`, 'wait');
+          scheduleTick(1000);
+          return;
+        }
+        state.manualStopConfirmPending = false;
+      }
+      if (state.recoveryName) {
+        const recovering = rows.find((row) => row.name === state.recoveryName);
+        if (!recovering) {
+          stop(`找不到正在恢复的环境 ${state.recoveryName}，脚本已停止。`);
+          return;
+        }
+        await recoverError(recovering);
+        return;
       }
 
       const pending = state.pendingName ? rows.find((row) => row.name === state.pendingName) : null;
@@ -564,21 +688,32 @@
           return;
         }
         if (isErrorStatus(pending.status)) {
-          stop(`${pending.name} 进入 Error，请先在页面处理后再重试。`);
+          await recoverError(pending);
           return;
         }
-        if (resourceErrorVisible() && isStoppedStatus(pending.status)) {
-          closeStartDialog();
+        if (isStoppedStatus(pending.status)) {
+          const startDialog = findStartConfirmationDialog(pending.name);
+          if (Date.now() - state.pendingSince < 15000 || isStartSubmissionInProgress(startDialog)) {
+            if (Date.now() - state.pendingSince > 10 * 60 * 1000) {
+              stop(`${pending.name} 的启动请求持续超过 10 分钟，请检查页面后再试。`);
+              return;
+            }
+            scheduleTick(1000);
+            return;
+          }
+          if (startDialog) closeStartDialog(pending.name);
           state.pendingName = null;
           state.pendingSince = 0;
-          retryAfterResourceShortage();
+          state.confirmAwaiting = false;
+          state.manualConfirmPending = false;
+          retryStartAfter(`${pending.name} 仍为 Stopped`);
           return;
         }
         if (Date.now() - state.pendingSince < 15000) {
           scheduleTick(1000);
           return;
         }
-        stop(`${pending.name} 点击确认后仍显示「${pending.status}」，且页面没有资源不足提示；为避免重复提交，脚本已停止。`);
+        stop(`${pending.name} 点击确认后仍显示「${pending.status}」；为避免重复提交，脚本已停止。`);
         return;
       }
 
@@ -589,7 +724,7 @@
       }
       const error = rows.find((row) => isErrorStatus(row.status));
       if (error) {
-        stop(`${error.name} 处于 Error，请先在页面处理后再重试。`);
+        await recoverError(error);
         return;
       }
 
@@ -721,7 +856,7 @@
           <div class="target-list" data-role="targets"></div>
           <div class="settings">
             <label>检查间隔（毫秒）<input data-setting="intervalMs" type="number" min="1500" max="60000" step="500"></label>
-            <label>资源不足后重试（毫秒）<input data-setting="retryDelayMs" type="number" min="5000" max="300000" step="5000"></label>
+            <label>启动失败后重试（毫秒）<input data-setting="retryDelayMs" type="number" min="5000" max="300000" step="5000"></label>
             <label>自动点击确认<input data-setting="autoConfirm" type="checkbox"></label>
             <label>成功后自动停止<input data-setting="stopOnSuccess" type="checkbox"></label>
             <label>前台时保持屏幕唤醒<input data-setting="keepAwake" type="checkbox"></label>
@@ -729,7 +864,7 @@
           <div class="status" data-role="status">脚本已加载，默认不会自动点击。</div>
           <div class="log" data-role="log"></div>
           <div class="footer"><span data-role="log-count">0 条</span><button type="button" data-action="toggle-log">查看完整日志</button></div>
-          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。只点击目标行可见的“启动/开机/Start”。</div>
+          <div class="hint">后台使用 Worker 尝试保持计时，切回页面会立即补查；浏览器冻结整页时仍会暂停。遇到 Error 时会点目标行 Stop/关机，等恢复已关机后按重试间隔再启动；Start 后状态仍为已关机也会等待后重试。</div>
         </div>
       </section>
     `;
@@ -777,6 +912,7 @@
     state.ticking = false;
     state.pendingName = null;
     state.pendingSince = 0;
+    clearErrorRecovery();
     state.lastActionAt = 0;
     state.retryNotBefore = 0;
     state.unavailableSince = 0;
