@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CANNLab 自动开机/抢卡助手
 // @namespace    https://github.com/KaranocaVe/cannlab-envpilot
-// @version      1.5.1
-// @description  自动识别 CANNLab 环境；仅在明确提示资源不足时重试，Error 时先停止再恢复。
+// @version      1.5.2
+// @description  自动识别 CANNLab 环境；资源不足时重试，Error 时停止恢复后继续启动。
 // @author       KaranocaVe
 // @match        https://gitcode.com/org/cann/cannlab/environment*
 // @updateURL    https://raw.githubusercontent.com/KaranocaVe/cannlab-envpilot/main/userscripts/cannlab-card-grabber.user.js
@@ -74,6 +74,7 @@
     manualStopConfirmPending: false,
     recoveryName: null,
     recoverySince: 0,
+    stopDialogBaseline: new Set(),
     lastActionAt: 0,
     unavailableSince: 0,
     unavailableSignature: '',
@@ -239,9 +240,12 @@
   }
 
   function findStopDialog(targetName = state.recoveryName) {
+    const otherTargets = getRows().map((row) => row.name).filter((name) => name !== targetName);
     return getVisibleDialogs().find((dialog) => {
       const text = cleanText(dialog.innerText);
-      return Boolean(targetName && text.includes(targetName))
+      const mentionsAnotherTarget = otherTargets.some((name) => text.includes(name));
+      return !state.stopDialogBaseline.has(dialog)
+        && !mentionsAnotherTarget
         && STOP_CONFIRMATION_TEXT.test(text)
         && [...dialog.querySelectorAll('button, [role="button"]')]
           .some((button) => isVisible(button) && !isDisabled(button)
@@ -518,25 +522,18 @@
   async function confirmPowerOff(targetName) {
     const deadline = Date.now() + 2500;
     while (state.running && Date.now() < deadline) {
-      const dialog = getVisibleDialogs().find((candidate) =>
-        STOP_CONFIRMATION_TEXT.test(cleanText(candidate.innerText)));
+      const dialog = findStopDialog(targetName);
       if (dialog) {
-        const text = cleanText(dialog.innerText);
-        if (!text.includes(targetName)) {
-          stop(`停止确认框中无法核对目标环境 ${targetName}，脚本已停止。`);
-          return false;
-        }
-        if (!findStopDialog(targetName)) {
-          stop(`${targetName} 的停止确认框没有可识别的确认按钮，脚本已停止；请检查页面。`);
-          return false;
-        }
         if (!settings.autoConfirm) {
           state.manualStopConfirmPending = true;
           log(`已点击 ${targetName} 的 Stop，等待你确认停止后继续重试。`, 'wait');
           return false;
         }
         if (clickDialogButton(dialog, STOP_CONFIRM_ACTION_LABEL)) {
-          log(`已确认停止 ${targetName}，等待环境恢复到已关机状态。`, 'wait');
+          const nameNote = cleanText(dialog.innerText).includes(targetName)
+            ? ''
+            : '（确认框未重复环境名，按目标行匹配）';
+          log(`已确认停止 ${targetName}${nameNote}，等待环境恢复到已关机状态。`, 'wait');
           return true;
         }
       }
@@ -549,6 +546,7 @@
     state.recoveryName = null;
     state.recoverySince = 0;
     state.manualStopConfirmPending = false;
+    state.stopDialogBaseline = new Set();
   }
 
   async function recoverError(item) {
@@ -567,6 +565,7 @@
       state.resourceShortageSeen = false;
       state.confirmAwaiting = false;
       state.manualConfirmPending = false;
+      state.stopDialogBaseline = new Set(getVisibleDialogs());
       if (!clickElement(stopButton)) {
         clearErrorRecovery();
         stop(`${item.name} 的 Stop/关机按钮不可用，脚本已停止。`);

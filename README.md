@@ -79,8 +79,10 @@ English labels for start, stop, running, stopped, and error states.
 The script uses visible DOM buttons only; it does not call CANNLab APIs, replay
 network requests, or create environments. It checks the page every 2.5 seconds.
 When a selected environment enters `Error`, it clicks that row's Stop button,
-auto-confirms only a dialog that names the selected environment and a recognized
-Stop action, then waits for the status to return to `Stopped`/`已关机`. After the
+then auto-confirms only a fresh dialog opened by that click and containing a
+recognized Stop action. The dialog may omit the environment name because the
+target is established by the row whose Stop button was clicked. It then waits
+for the status to return to `Stopped`/`已关机`. After the
 configured retry delay (30 seconds by default), it tries to start again. If Stop
 is unavailable, the confirmation cannot be matched, or the environment does not
 return to a stopped state within 30 seconds, the script stops and reports the
